@@ -13,6 +13,7 @@ const envSchema = z.object({
     .min(1)
     .max(65535)
     .default(3333),
+  HOST: z.string().default("0.0.0.0"),
   DATABASE_URL: z
     .string()
     .min(1, "DATABASE_URL is required"),

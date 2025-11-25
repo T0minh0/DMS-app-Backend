@@ -7,9 +7,9 @@ async function main() {
   try {
     await server.listen({
       port: env.PORT,
-      host: "0.0.0.0"
+      host: env.HOST
     });
-    server.log.info(`HTTP server listening on port ${env.PORT}`);
+    server.log.info(`HTTP server listening on ${env.HOST}:${env.PORT}`);
   } catch (error) {
     server.log.error(error);
     process.exit(1);

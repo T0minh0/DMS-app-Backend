@@ -26,7 +26,7 @@ const createWeighingBodySchema = z.object({
 });
 
 type MeasurementWithMaterial = Prisma.MeasurmentsGetPayload<{
-  include: { materialRef: true };
+  include: { materialRef: { include: { group: true } } };
 }>;
 
 async function resolveMaterial(identifier: string) {
@@ -66,12 +66,16 @@ function gramsToKilogramsDecimal(grams: number) {
 function measurementToDto(measurement: MeasurementWithMaterial) {
   const weightKg = new Prisma.Decimal(measurement.weightKg);
   const weightGrams = weightKg.mul(1000).toNumber();
+  const group = measurement.materialRef?.group;
 
   return {
     id: measurement.weightingId.toString(),
     userId: measurement.wastepicker.toString(),
     materialId: measurement.material.toString(),
     materialName: measurement.materialRef?.materialName ?? "Material",
+    materialGroup: group
+      ? { id: group.groupId.toString(), name: group.groupName }
+      : null,
     weightGrams: Math.round(weightGrams),
     createdAt: measurement.timeStamp.toISOString()
   };
@@ -91,7 +95,7 @@ export const weighingsRoutes: FastifyPluginAsync = async (server) => {
           wastepicker: workerId
         },
         include: {
-          materialRef: true
+          materialRef: { include: { group: true } }
         },
         orderBy: {
           timeStamp: "desc"
@@ -154,7 +158,7 @@ export const weighingsRoutes: FastifyPluginAsync = async (server) => {
           device: device.deviceId
         },
         include: {
-          materialRef: true
+          materialRef: { include: { group: true } }
         }
       });
 

@@ -1,26 +1,21 @@
 # DMS Backend
 
-This folder contains a lightweight Node.js service configured with Prisma to manage the database that matches `ExistingDB/New_db_schema.sql`.
+This folder contains the **DMS mobile backend** — a lightweight Fastify + Prisma HTTP API consumed by the waste-pickers' mobile app. It shares a single PostgreSQL database with the manager web portal (`Web/DMS_NextJS_MGM`), which owns the Prisma schema and all migrations.
 
 ## Setup
 
-1. Duplicate `.env.example` into `.env` and update the variables with your Postgres connection strings and API secrets:
+1. Duplicate `.env.example` into `.env` and fill in your Postgres connection string and JWT secret:
 
    ```bash
-   cp backend/.env.example backend/.env
-   # edit backend/.env to match your credentials
+   cp .env.example .env
+   # edit .env to match your credentials
    ```
 
-   > ℹ️ Prisma requires the shadow database to point to a different schema than the main connection. For local development you can reuse the same database instance by targeting another schema, e.g. `DATABASE_URL=...schema=public` and `SHADOW_DATABASE_URL=...schema=shadow`. Be sure to create that schema beforehand:
-   >
-   > ```sql
-   > CREATE SCHEMA IF NOT EXISTS shadow;
-   > ```
+   Required: `DATABASE_URL` (the shared PostgreSQL) and `JWT_SECRET` (at least 32 characters). `src/env.ts` validates them on boot.
 
 2. Install dependencies:
 
    ```bash
-   cd backend
    npm install
    ```
 
@@ -30,35 +25,24 @@ This folder contains a lightweight Node.js service configured with Prisma to man
    npm run prisma:generate
    ```
 
-4. (Optional, but recommended for local QA) seed a cooperative, workers, materials and demo measurements:
+## Schema & database
 
-   ```bash
-   npm run prisma:seed
-   ```
+The PostgreSQL database is **shared with the web portal** (`Web/DMS_NextJS_MGM`), which owns the Prisma schema and all migrations. This backend **never migrates the database** — it only reads and writes through the Prisma Client.
 
-   The seed script is idempotent and can be executed multiple times. It creates a demo worker (`coletor@example.com` / `senha123`) that can be used by the mobile app.
-
-## Applying the schema
-
-- To create/update the database structure defined in `prisma/schema.prisma` run:
-
-  ```bash
-  npm run prisma:push
-  ```
-
-  This mirrors the tables described in `ExistingDB/New_db_schema.sql`.
-
-- If the database already contains the tables and you only want to inspect them, use:
+- To re-sync `prisma/schema.prisma` with the live database (e.g. after the portal ships a migration), introspect it and regenerate the client:
 
   ```bash
   npx prisma db pull
+  npm run prisma:generate
   ```
 
-- You can inspect and seed data through Prisma Studio:
+- Inspect data through Prisma Studio:
 
   ```bash
   npm run prisma:studio
   ```
+
+> ⚠️ Never run `prisma db push` or `prisma migrate` from this backend — a stale-schema push would drop tables. Migrations are the portal's responsibility.
 
 ## Running the API
 
@@ -74,14 +58,12 @@ The API listens on `PORT` (default `3333`). A quick smoke test:
 curl http://localhost:3333/health
 ```
 
-You can now authenticate with the seeded worker (CPF `00000000000`):
+Authenticate with a valid worker's CPF and password:
 
 ```bash
-curl -X POST http://localhost:3333/auth/login \\
-  -H 'Content-Type: application/json' \\
-  -d '{"cpf":"00000000000","password":"senha123"}'
+curl -X POST http://localhost:3333/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"cpf":"<cpf>","password":"<password>"}'
 ```
 
 The response returns a JWT token that the mobile app reuses for protected routes.
-
-# DMS-app-Backend

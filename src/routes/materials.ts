@@ -5,25 +5,35 @@ export const materialsRoutes: FastifyPluginAsync = async (server) => {
   server.get(
     "/",
     {
-      preHandler: [server.authenticate]
+      preHandler: [server.authenticate],
     },
     async () => {
       const materials = await prisma.materials.findMany({
         select: {
           materialId: true,
-          materialName: true
+          materialName: true,
+          group: {
+            select: {
+              groupId: true,
+              groupName: true,
+            },
+          },
         },
         orderBy: {
-          materialName: "asc"
-        }
+          materialName: "asc",
+        },
       });
 
       return materials.map((material) => ({
         id: material.materialId.toString(),
-        name: material.materialName
+        name: material.materialName,
+        group: material.group
+          ? {
+              id: material.group.groupId.toString(),
+              name: material.group.groupName,
+            }
+          : null,
       }));
-    }
+    },
   );
 };
-
-

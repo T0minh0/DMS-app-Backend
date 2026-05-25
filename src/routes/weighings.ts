@@ -2,6 +2,8 @@ import { FastifyPluginAsync } from "fastify";
 import { Prisma } from "@prisma/client";
 import { prisma } from "../prisma";
 import { z } from "zod";
+import { mapUserTypeToRole } from "../lib/userType";
+import { sendWeighingNotification } from "../services/pushNotifications";
 
 const createWeighingBodySchema = z.object({
   materialId: z
@@ -22,11 +24,21 @@ const createWeighingBodySchema = z.object({
     .trim()
     .min(1)
     .optional(),
-  bagFilled: z.boolean().optional()
+  bagFilled: z.boolean().optional(),
+  // Quando o operador eh gestor, identifica a quem atribuir a pesagem. Catador
+  // logado tem esse campo ignorado (usa o proprio id).
+  wastepickerId: z
+    .string()
+    .trim()
+    .min(1)
+    .optional()
 });
 
-type MeasurementWithMaterial = Prisma.MeasurmentsGetPayload<{
-  include: { materialRef: { include: { group: true } } };
+type MeasurementWithRefs = Prisma.MeasurmentsGetPayload<{
+  include: {
+    materialRef: { include: { group: true } };
+    wastepickerRef: { select: { workerId: true; workerName: true } };
+  };
 }>;
 
 async function resolveMaterial(identifier: string) {
@@ -63,7 +75,7 @@ function gramsToKilogramsDecimal(grams: number) {
   return new Prisma.Decimal(grams).div(1000);
 }
 
-function measurementToDto(measurement: MeasurementWithMaterial) {
+function measurementToDto(measurement: MeasurementWithRefs) {
   const weightKg = new Prisma.Decimal(measurement.weightKg);
   const weightGrams = weightKg.mul(1000).toNumber();
   const group = measurement.materialRef?.group;
@@ -71,6 +83,8 @@ function measurementToDto(measurement: MeasurementWithMaterial) {
   return {
     id: measurement.weightingId.toString(),
     userId: measurement.wastepicker.toString(),
+    wastepickerId: measurement.wastepicker.toString(),
+    wastepickerName: measurement.wastepickerRef?.workerName ?? null,
     materialId: measurement.material.toString(),
     materialName: measurement.materialRef?.materialName ?? "Material",
     materialGroup: group
@@ -95,7 +109,8 @@ export const weighingsRoutes: FastifyPluginAsync = async (server) => {
           wastepicker: workerId
         },
         include: {
-          materialRef: { include: { group: true } }
+          materialRef: { include: { group: true } },
+          wastepickerRef: { select: { workerId: true, workerName: true } }
         },
         orderBy: {
           timeStamp: "desc"
@@ -113,21 +128,76 @@ export const weighingsRoutes: FastifyPluginAsync = async (server) => {
       preHandler: [server.authenticate]
     },
     async (request) => {
-      const workerId = BigInt(request.user.userId);
+      const operatorId = BigInt(request.user.userId);
       const body = createWeighingBodySchema.parse(request.body);
 
-      const worker = await prisma.workers.findUnique({
-        where: { workerId },
+      const operator = await prisma.workers.findUnique({
+        where: { workerId: operatorId },
         select: {
           workerId: true,
+          userType: true,
           cooperative: true
         }
       });
 
-      if (!worker?.cooperative) {
+      if (!operator?.cooperative) {
         throw server.httpErrors.badRequest(
           "Cooperativa não encontrada para o trabalhador autenticado."
         );
+      }
+
+      const operatorRole = mapUserTypeToRole(operator.userType);
+
+      // Decidir a quem atribuir a pesagem:
+      // - Gestor: precisa indicar `wastepickerId` no body; valida que o catador
+      //   existe, pertence a mesma cooperativa e eh de fato catador.
+      // - Catador: usa o proprio id (compat com fluxo antigo de self-service).
+      let wastepickerId: bigint;
+
+      if (operatorRole === "manager") {
+        if (!body.wastepickerId) {
+          throw server.httpErrors.badRequest(
+            "Gestor precisa informar wastepickerId ao registrar uma pesagem."
+          );
+        }
+
+        let parsedWastepickerId: bigint;
+        try {
+          parsedWastepickerId = BigInt(body.wastepickerId);
+        } catch {
+          throw server.httpErrors.badRequest("wastepickerId invalido.");
+        }
+
+        const target = await prisma.workers.findUnique({
+          where: { workerId: parsedWastepickerId },
+          select: {
+            workerId: true,
+            userType: true,
+            cooperative: true,
+            exitDate: true
+          }
+        });
+
+        if (!target) {
+          throw server.httpErrors.notFound("Catador nao encontrado.");
+        }
+        if (target.cooperative !== operator.cooperative) {
+          throw server.httpErrors.forbidden(
+            "Catador pertence a outra cooperativa."
+          );
+        }
+        if (target.exitDate) {
+          throw server.httpErrors.badRequest("Catador inativo.");
+        }
+        if (mapUserTypeToRole(target.userType) !== "worker") {
+          throw server.httpErrors.badRequest(
+            "wastepickerId precisa apontar para um catador."
+          );
+        }
+
+        wastepickerId = parsedWastepickerId;
+      } else {
+        wastepickerId = operatorId;
       }
 
       const material = await resolveMaterial(body.materialId);
@@ -137,13 +207,13 @@ export const weighingsRoutes: FastifyPluginAsync = async (server) => {
       }
 
       let device = await prisma.devices.findFirst({
-        where: { cooperativeId: worker.cooperative }
+        where: { cooperativeId: operator.cooperative }
       });
 
       if (!device) {
         device = await prisma.devices.create({
           data: {
-            cooperativeId: worker.cooperative
+            cooperativeId: operator.cooperative
           }
         });
       }
@@ -153,14 +223,29 @@ export const weighingsRoutes: FastifyPluginAsync = async (server) => {
           weightKg: gramsToKilogramsDecimal(body.weightGrams),
           timeStamp: new Date(),
           bagFilled: body.bagFilled ?? false,
-          wastepicker: workerId,
+          wastepicker: wastepickerId,
           material: material.materialId,
           device: device.deviceId
         },
         include: {
-          materialRef: { include: { group: true } }
+          materialRef: { include: { group: true } },
+          wastepickerRef: { select: { workerId: true, workerName: true } }
         }
       });
+
+      // So notifica quando foi gestor que pesou — catador em modo legado nao
+      // precisa de push (a propria UI ja deu feedback).
+      if (operatorRole === "manager") {
+        // Fire-and-forget: nao bloqueia a resposta. Erros sao tratados dentro
+        // do servico (best-effort, log.warn).
+        void sendWeighingNotification({
+          wastepickerId,
+          materialName: measurement.materialRef?.materialName ?? "Material",
+          weightGrams: body.weightGrams,
+          weighingId: measurement.weightingId,
+          log: request.log
+        });
+      }
 
       return measurementToDto(measurement);
     }

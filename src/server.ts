@@ -11,6 +11,8 @@ import { materialsRoutes } from "./routes/materials";
 import { noticesRoutes } from "./routes/notices";
 import { birthdaysRoutes } from "./routes/birthdays";
 import { gamificationRoutes } from "./routes/gamification";
+import { workersRoutes } from "./routes/workers";
+import { pushRoutes } from "./routes/push";
 
 export function buildServer() {
   const server = Fastify({
@@ -107,6 +109,8 @@ export function buildServer() {
   void server.register(noticesRoutes, { prefix: "/notices" });
   void server.register(birthdaysRoutes, { prefix: "/birthdays" });
   void server.register(gamificationRoutes, { prefix: "/gamification" });
+  void server.register(workersRoutes, { prefix: "/workers" });
+  void server.register(pushRoutes, { prefix: "/devices" });
 
   return server;
 }

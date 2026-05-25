@@ -125,6 +125,7 @@ model Workers {
   workerAchievements          WorkerAchievement[]
   leaderboardEntries          LeaderboardEntry[]
   workerLevel                 WorkerLevel?
+  pushTokens                  WorkerPushToken[]
 
   @@unique([workerId, cooperative], map: "Workers_worker_cooperative_key")
   @@map("Workers")
@@ -388,4 +389,25 @@ model WorkerLevel {
 
   @@index([currentLevel], map: "worker_level_current_level_idx")
   @@map("worker_level")
+}
+
+/// Tokens de push notification (Expo) por catador. Um worker pode ter varios
+/// tokens (multiplos devices). Tokens unicos por valor — se o mesmo device
+/// for usado por outro user, o `workerId` eh atualizado via upsert.
+///
+/// **Schema autoritativo no portal web** (`Web/DMS_NextJS_MGM`). Este model
+/// aqui eh apenas espelhamento para o Prisma Client do backend mobile gerar
+/// os tipos. A migration SQL vive em
+/// `Web/DMS_NextJS_MGM/prisma/migrations/20260525000000_add_worker_push_token`.
+model WorkerPushToken {
+  id        BigInt   @id @default(autoincrement())
+  workerId  BigInt   @map("worker_id")
+  token     String   @unique
+  platform  String   @db.VarChar(16) // "ios" | "android"
+  lastSeen  DateTime @default(now()) @map("last_seen") @db.Timestamp(6)
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamp(6)
+  worker    Workers  @relation(fields: [workerId], references: [workerId], onDelete: Cascade, map: "worker_push_token_worker_id_fkey")
+
+  @@index([workerId], map: "worker_push_token_worker_id_idx")
+  @@map("worker_push_token")
 }

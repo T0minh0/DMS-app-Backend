@@ -2,6 +2,7 @@ import { FastifyPluginAsync } from "fastify";
 import { z } from "zod";
 import { prisma } from "../prisma";
 import { compare, hash } from "bcryptjs";
+import { mapUserTypeToRole } from "../lib/userType";
 
 const loginBodySchema = z.object({
   cpf: z
@@ -25,6 +26,7 @@ export const authRoutes: FastifyPluginAsync = async (server) => {
           email: true,
           cpf: true,
           password: true,
+          userType: true,
           cooperative: true,
           cooperativeRef: {
             select: {
@@ -62,6 +64,7 @@ export const authRoutes: FastifyPluginAsync = async (server) => {
           name: worker.workerName,
           email: worker.email,
           cpf: workerCpf,
+          userType: mapUserTypeToRole(worker.userType),
           cooperativeId: worker.cooperative
             ? worker.cooperative.toString()
             : null,
@@ -88,6 +91,7 @@ export const authRoutes: FastifyPluginAsync = async (server) => {
           workerName: true,
           email: true,
           cpf: true,
+          userType: true,
           cooperative: true,
           cooperativeRef: {
             select: {
@@ -112,6 +116,7 @@ export const authRoutes: FastifyPluginAsync = async (server) => {
         name: worker.workerName,
         email: worker.email,
         cpf: workerCpf,
+        userType: mapUserTypeToRole(worker.userType),
         cooperativeId: worker.cooperative
           ? worker.cooperative.toString()
           : null,
@@ -197,6 +202,7 @@ export const authRoutes: FastifyPluginAsync = async (server) => {
             name: worker.workerName,
             email: worker.email,
             cpf: workerCpf,
+            userType: mapUserTypeToRole(worker.userType),
             cooperativeId: worker.cooperative
               ? worker.cooperative.toString()
               : null,
@@ -215,6 +221,7 @@ export const authRoutes: FastifyPluginAsync = async (server) => {
           workerName: true,
           email: true,
           cpf: true,
+          userType: true,
           cooperative: true,
           cooperativeRef: {
             select: {
@@ -237,6 +244,7 @@ export const authRoutes: FastifyPluginAsync = async (server) => {
           name: updatedWorker.workerName,
           email: updatedWorker.email,
           cpf: workerCpf,
+          userType: mapUserTypeToRole(updatedWorker.userType),
           cooperativeId: updatedWorker.cooperative
             ? updatedWorker.cooperative.toString()
             : null,

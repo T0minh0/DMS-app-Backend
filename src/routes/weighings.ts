@@ -4,6 +4,7 @@ import { prisma } from "../prisma";
 import { z } from "zod";
 import { mapUserTypeToRole } from "../lib/userType";
 import { sendWeighingNotification } from "../services/pushNotifications";
+import { recordMobileWeighing } from "../lib/weighings/recordMobileWeighing";
 
 const createWeighingBodySchema = z.object({
   materialId: z
@@ -91,6 +92,7 @@ function measurementToDto(measurement: MeasurementWithRefs) {
       ? { id: group.groupId.toString(), name: group.groupName }
       : null,
     weightGrams: Math.round(weightGrams),
+    bagFilled: measurement.bagFilled,
     createdAt: measurement.timeStamp.toISOString()
   };
 }
@@ -218,20 +220,19 @@ export const weighingsRoutes: FastifyPluginAsync = async (server) => {
         });
       }
 
-      const measurement = await prisma.measurments.create({
-        data: {
-          weightKg: gramsToKilogramsDecimal(body.weightGrams),
-          timeStamp: new Date(),
+      const measuredAt = new Date();
+      const result = await prisma.$transaction((tx) =>
+        recordMobileWeighing(tx, {
+          cooperativeId: operator.cooperative,
+          workerId: wastepickerId,
+          materialId: material.materialId,
+          deviceId: device.deviceId,
+          reportedWeightKg: gramsToKilogramsDecimal(body.weightGrams),
           bagFilled: body.bagFilled ?? false,
-          wastepicker: wastepickerId,
-          material: material.materialId,
-          device: device.deviceId
-        },
-        include: {
-          materialRef: { include: { group: true } },
-          wastepickerRef: { select: { workerId: true, workerName: true } }
-        }
-      });
+          measuredAt
+        })
+      );
+      const measurement = result.measurement;
 
       // So notifica quando foi gestor que pesou — catador em modo legado nao
       // precisa de push (a propria UI ja deu feedback).
@@ -269,4 +270,3 @@ export const weighingsRoutes: FastifyPluginAsync = async (server) => {
     }
   );
 };
-

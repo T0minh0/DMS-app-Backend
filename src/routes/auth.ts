@@ -2,7 +2,7 @@ import { FastifyPluginAsync } from "fastify";
 import { z } from "zod";
 import { prisma } from "../prisma";
 import { compare, hash } from "bcryptjs";
-import { limit } from "./recovery";
+import { limit, checkLimit, clearLimit } from "./recovery";
 import { validNewPassword } from "../lib/auth/password";
 import { makeRefresh } from "../lib/auth/session";
 import { mapUserTypeToRole } from "../lib/userType";
@@ -22,7 +22,7 @@ export const authRoutes: FastifyPluginAsync = async (server) => {
     "/login",
     async (request, reply) => {
       const { cpf, password, sessionVersion } = loginBodySchema.parse(request.body);
-      const allowed = await Promise.all([limit(`login:cpf:${cpf}`, 10, 900), limit(`login:ip:${request.ip}`, 100, 900)]);
+      const allowed = await Promise.all([checkLimit(`login:cpf:${cpf}`, 10), limit(`login:ip:${request.ip}`, 100, 900)]);
       if (!allowed.every(Boolean)) throw server.httpErrors.tooManyRequests("Muitas tentativas. Tente mais tarde.");
       const worker = await prisma.workers.findFirst({
         where: { cpf: Buffer.from(cpf, "utf-8") },
@@ -44,21 +44,20 @@ export const authRoutes: FastifyPluginAsync = async (server) => {
         }
       });
 
-      if (!worker || !worker.password) {
-        throw server.httpErrors.unauthorized("Credenciais inválidas.");
-      }
-
-      const passwordHash = Buffer.from(worker.password).toString("utf-8");
+      const passwordHash = worker?.password ? Buffer.from(worker.password).toString("utf-8") : '$2a$10$7EqJtq98hPqEX7fNZaFWoO5uG9KWSJ3TXwKEt5S9tMyYXtFMwJDpa';
       const isValidPassword = await compare(password, passwordHash);
-
-      if (!isValidPassword) {
+      if (!worker || !worker.password || !isValidPassword) {
+        await limit(`login:cpf:${cpf}`, 10, 900);
         throw server.httpErrors.unauthorized("Credenciais inválidas.");
       }
 
+      await clearLimit(`login:cpf:${cpf}`);
+      const session = sessionVersion === 2 ? await makeRefresh(worker.workerId, worker.authVersion) : undefined;
       const token = await server.jwt.sign({
-        userId: worker.workerId.toString(), authVersion: worker.authVersion
-      }, sessionVersion === 2 ? { expiresIn: "15m" } : {});
-      const refreshToken = sessionVersion === 2 ? await makeRefresh(worker.workerId, worker.authVersion) : undefined;
+        userId: worker.workerId.toString(), authVersion: worker.authVersion,
+        ...(session ? { sessionVersion: 2, sid: session.id } : {})
+      }, session ? { expiresIn: "15m" } : {});
+      const refreshToken = session?.token;
 
       const workerCpf =
         worker.cpf && worker.cpf.length > 0
@@ -228,9 +227,10 @@ export const authRoutes: FastifyPluginAsync = async (server) => {
 
       updateData.lastUpdate = new Date();
 
-      const updatedWorker = await prisma.workers.update({
+      const changed = await prisma.workers.updateMany({ where: { workerId, authVersion: worker.authVersion }, data: updateData });
+      if (changed.count !== 1) throw server.httpErrors.conflict("Sessão ou credencial alterada. Entre novamente.");
+      const updatedWorker = await prisma.workers.findUniqueOrThrow({
         where: { workerId },
-        data: updateData,
         select: {
           workerId: true,
           workerName: true,

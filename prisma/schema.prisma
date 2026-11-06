@@ -416,6 +416,7 @@ model WorkerPushToken {
 }
 
 model AuthRefreshSession {
+  revokedAt DateTime?
   id String @id
   workerId BigInt
   tokenHash String @unique
@@ -450,5 +451,21 @@ model AuthAssistanceAudit {
   managerId BigInt
   workerId BigInt
   reason String
+  createdAt DateTime @default(now())
+}
+
+model AuthRefreshToken {
+  tokenHash String @id
+  sessionId String
+  consumedAt DateTime?
+  createdAt DateTime @default(now())
+  @@index([sessionId])
+}
+model AuthMailOutbox {
+  id String @id
+  payload String
+  availableAt DateTime @default(now())
+  lockedUntil DateTime?
+  attempts Int @default(0)
   createdAt DateTime @default(now())
 }

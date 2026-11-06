@@ -13,10 +13,14 @@ declare module "@fastify/jwt" {
     payload: {
       userId: string;
       authVersion?: number;
+      sessionVersion?: number;
+      sid?: string;
     };
     user: {
       userId: string;
       authVersion?: number;
+      sessionVersion?: number;
+      sid?: string;
     };
   }
 }

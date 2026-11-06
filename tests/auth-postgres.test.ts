@@ -1,0 +1,103 @@
+import { test } from 'node:test';
+import { strict as assert } from 'node:assert';
+import { createHash, randomUUID } from 'node:crypto';
+import { hash, compare } from 'bcryptjs';
+
+const database = process.env.AUTH_TEST_DATABASE_URL;
+const safe = ['postgresql://cammis@127.0.0.1:55491/dms_auth_test', 'postgresql://cammis@127.0.0.1:55491/dms_auth_migration'].includes(database ?? '');
+const digest = (s: string) => createHash('sha256').update(s).digest('hex');
+
+test('isolated PostgreSQL authentication regressions', { skip: !safe }, async t => {
+  process.env.DATABASE_URL = database!;
+  process.env.JWT_SECRET = 'test-secret-with-at-least-32-characters';
+  process.env.NODE_ENV = 'test';
+  process.env.RESEND_API_KEY = 'test-only'; process.env.RECOVERY_EMAIL_FROM = 'test@example.test'; process.env.RECOVERY_WEB_URL = 'https://example.test';
+  const { prisma } = await import('../src/prisma'); const { buildServer } = await import('../src/server');
+  await prisma.authRecoveryToken.deleteMany(); await prisma.authRefreshToken.deleteMany(); await prisma.authRefreshSession.deleteMany(); await prisma.authMailOutbox.deleteMany(); await prisma.authAttemptLimit.deleteMany();
+  await prisma.workers.deleteMany({ where: { workerName: 'Auth test' } }); await prisma.cooperative.deleteMany({ where: { cooperativeName: 'Auth test' } });
+  const coop = await prisma.cooperative.create({ data:{cooperativeName:'Auth test'} });
+  const password = Buffer.from(await hash('initial-pass', 4));
+  const worker = await prisma.workers.create({ data:{workerName:'Auth test',cooperative:coop.cooperativeId,cpf:Buffer.from('33333333333'),userType:'1',birthDate:new Date('2000-01-01'),enterDate:new Date('2020-01-01'),pis:Buffer.from('0'),rg:Buffer.from('0'),password,email:'x@example.test',recoveryEmail:'old@example.test',recoveryEmailVerified:true} });
+  const server = buildServer(); await server.ready();
+  const login = async () => { const r = await server.inject({method:'POST',url:'/auth/login',payload:{cpf:'33333333333',password:'initial-pass',sessionVersion:2}}); assert.equal(r.statusCode,200); return r.json(); };
+  const me = (token: string) => server.inject({method:'GET',url:'/auth/me',headers:{authorization:`Bearer ${token}`}});
+  await t.test('logout revokes access already issued to this session', async () => {
+    const s = await login(); await server.inject({method:'POST',url:'/auth/logout',payload:{refreshToken:s.refreshToken}}); assert.equal((await me(s.accessToken)).statusCode,401);
+  });
+  await t.test('refresh replay revokes the successor session', async () => {
+    const s = await login(); const rotate = (token:string) => server.inject({method:'POST',url:'/auth/refresh',payload:{refreshToken:token}});
+    const first = await rotate(s.refreshToken); assert.equal(first.statusCode,200); const successor = first.json(); assert.equal((await rotate(s.refreshToken)).statusCode,401); assert.equal((await rotate(successor.refreshToken)).statusCode,401); assert.equal((await me(successor.accessToken)).statusCode,401);
+  });
+  await t.test('concurrent refresh replay revokes even the winning successor', async () => {
+    const s = await login(); const responses = await Promise.all([1,2].map(()=>server.inject({method:'POST',url:'/auth/refresh',payload:{refreshToken:s.refreshToken}})));
+    assert.deepEqual(responses.map(r=>r.statusCode).sort(),[200,401]); const success = responses.find(r=>r.statusCode===200)!.json();
+    assert.equal((await me(success.accessToken)).statusCode,401); assert.equal((await server.inject({method:'POST',url:'/auth/refresh',payload:{refreshToken:success.refreshToken}})).statusCode,401);
+  });
+  await t.test('successful logins do not spend the account failure budget', async () => {
+    for (let i=0; i<11; i++) { const r = await server.inject({method:'POST',url:'/auth/login',payload:{cpf:'33333333333',password:'initial-pass'}}); assert.equal(r.statusCode,200); }
+  });
+  await t.test('stale authenticated password writer cannot overwrite a completed reset', async () => {
+    await prisma.authAttemptLimit.deleteMany(); const s = await login();
+    await prisma.authRecoveryToken.create({data:{id:randomUUID(),workerId:worker.workerId,authVersion:0,tokenHash:digest('race-reset'),purpose:'reset',expiresAt:new Date(Date.now()+600000)}});
+    const original = prisma.workers.updateMany.bind(prisma.workers); let ready!:()=>void; let release!:()=>void;
+    const blocked = new Promise<void>(resolve => { ready=resolve; }); const gate = new Promise<void>(resolve=>{ release=resolve; }); let first=true;
+    (prisma.workers as any).updateMany = async (args:any) => { if (first && args.data.password) { first=false; ready(); await gate; } return original(args); };
+    const stale = server.inject({method:'PUT',url:'/auth/me',headers:{authorization:`Bearer ${s.accessToken}`},payload:{currentPassword:'initial-pass',newPassword:'other-password'}});
+    await blocked; const reset = await server.inject({method:'POST',url:'/auth/reset-password',payload:{token:'race-reset',newPassword:'58290417'}}); assert.equal(reset.statusCode,200); release(); const result = await stale; (prisma.workers as any).updateMany = original;
+    const current = await prisma.workers.findUniqueOrThrow({where:{workerId:worker.workerId}}); assert.notEqual(result.statusCode,200); assert.equal(await compare('58290417',Buffer.from(current.password).toString()),true);
+    await prisma.workers.update({where:{workerId:worker.workerId},data:{password,authVersion:{increment:1}}});
+  });
+  await t.test('replacing recovery email invalidates links to the previous mailbox', async () => {
+    const currentVersion = (await prisma.workers.findUniqueOrThrow({where:{workerId:worker.workerId}})).authVersion;
+    const old = await prisma.authRecoveryToken.create({data:{id:randomUUID(),workerId:worker.workerId,authVersion:currentVersion,tokenHash:digest('old-link'),purpose:'reset',expiresAt:new Date(Date.now()+600000)}});
+    await prisma.authRecoveryToken.create({data:{id:randomUUID(),workerId:worker.workerId,authVersion:currentVersion,tokenHash:digest('confirm-link'),purpose:'confirm',email:'new@example.test',expiresAt:new Date(Date.now()+600000)}});
+    assert.equal((await server.inject({method:'POST',url:'/auth/verify-recovery-email',payload:{token:'confirm-link'}})).statusCode,200);
+    assert.equal((await server.inject({method:'POST',url:'/auth/reset-password',payload:{token:'old-link',newPassword:'58290417'}})).statusCode,400);
+    assert.ok((await prisma.authRecoveryToken.findUnique({where:{id:old.id}}))?.consumedAt);
+  });
+  await t.test('concurrent email replacement and reset issuance leave no usable old-mailbox link', async () => {
+    await prisma.authAttemptLimit.deleteMany();
+    const current = await prisma.workers.update({where:{workerId:worker.workerId},data:{recoveryEmail:'race-old@example.test',recoveryEmailVerified:true}});
+    await prisma.authRecoveryToken.create({data:{id:randomUUID(),workerId:worker.workerId,authVersion:current.authVersion,tokenHash:digest('race-confirm'),purpose:'confirm',email:'race-new@example.test',expiresAt:new Date(Date.now()+600000)}});
+    const start = new Date();
+    const results = await Promise.all([server.inject({method:'POST',url:'/auth/verify-recovery-email',payload:{token:'race-confirm'}}),server.inject({method:'POST',url:'/auth/forgot-password',payload:{cpf:'33333333333'}})]);
+    assert.deepEqual(results.map(r=>r.statusCode),[200,200]);
+    const oldLinks = await prisma.authRecoveryToken.findMany({where:{workerId:worker.workerId,purpose:'reset',email:'race-old@example.test',createdAt:{gte:start}}});
+    assert.ok(oldLinks.every(r=>r.consumedAt));
+  });
+  await t.test('weak replacement passwords do not consume a valid reset link', async () => {
+    const current = await prisma.workers.findUniqueOrThrow({where:{workerId:worker.workerId}});
+    await prisma.authRecoveryToken.create({data:{id:randomUUID(),workerId:worker.workerId,authVersion:current.authVersion,tokenHash:digest('policy-link'),purpose:'reset',expiresAt:new Date(Date.now()+600000)}});
+    for (let i=0; i<5; i++) assert.equal((await server.inject({method:'POST',url:'/auth/reset-password',payload:{token:'policy-link',newPassword:'11111111'}})).statusCode,400);
+    assert.equal((await server.inject({method:'POST',url:'/auth/reset-password',payload:{token:'policy-link',newPassword:'58290417'}})).statusCode,200);
+  });
+  await t.test('concurrent reset token redemption succeeds only once', async () => {
+    const current = await prisma.workers.findUniqueOrThrow({where:{workerId:worker.workerId}});
+    await prisma.authRecoveryToken.create({data:{id:randomUUID(),workerId:worker.workerId,authVersion:current.authVersion,tokenHash:digest('double-reset'),purpose:'reset',expiresAt:new Date(Date.now()+600000)}});
+    const responses = await Promise.all([1,2].map(()=>server.inject({method:'POST',url:'/auth/reset-password',payload:{token:'double-reset',newPassword:'58290417'}})));
+    assert.deepEqual(responses.map(r=>r.statusCode).sort(),[200,400]);
+  });
+  await t.test('one-minute resend cooldown persists and mail stays encrypted', async () => {
+    await prisma.authAttemptLimit.deleteMany(); await prisma.authMailOutbox.deleteMany();
+    const request = () => server.inject({method:'POST',url:'/auth/forgot-password',payload:{cpf:'33333333333'}});
+    assert.equal((await request()).statusCode,200); assert.equal((await request()).statusCode,200);
+    const jobs = await prisma.authMailOutbox.findMany(); assert.equal(jobs.length,1); assert.doesNotMatch(jobs[0].payload,/race-new@example\.test|recuperar-senha/);
+  });
+  await t.test('outbox sends readable reset and change notices without disclosing passwords', async () => {
+    const { enqueueMail, processOutbox } = await import('../src/lib/auth/outbox'); await prisma.authMailOutbox.deleteMany();
+    await prisma.$transaction(async tx=>{ await enqueueMail(tx,{email:'new@example.test',token:'synthetic-token',purpose:'reset'}); await enqueueMail(tx,{email:'new@example.test',purpose:'notice'}); });
+    const sent:any[]=[]; const oldFetch=globalThis.fetch; globalThis.fetch=(async (_url:any, options:any)=>{sent.push(JSON.parse(options.body)); return new Response('{}',{status:200});}) as typeof fetch;
+    try { await processOutbox(); await processOutbox(); } finally { globalThis.fetch=oldFetch; }
+    assert.equal(sent.length,2); const reset = sent.find(x=>x.subject==='Recuperar senha'); const notice = sent.find(x=>x.subject==='Sua senha foi alterada');
+    assert.match(reset.text,/20 minutos/); assert.match(reset.text,/ignore/); assert.match(reset.html,/recuperar-senha/); assert.match(reset.html,/Redefinir senha/);
+    assert.ok(notice); assert.doesNotMatch(JSON.stringify(sent),/58290417|33333333333|initial-pass/);
+  });
+  await t.test('forgot password does not wait for email network delivery', async () => {
+    await prisma.authAttemptLimit.deleteMany();
+    let release!: () => void; const oldFetch = globalThis.fetch; globalThis.fetch = (() => new Promise<Response>(resolve => { release=()=>resolve(new Response('{}',{status:200})); })) as typeof fetch;
+    const request = server.inject({method:'POST',url:'/auth/forgot-password',payload:{cpf:'33333333333'}});
+    const completed = await Promise.race([request.then(()=>true),new Promise<boolean>(resolve=>setTimeout(()=>resolve(false),250))]);
+    if (release) release(); await request; globalThis.fetch = oldFetch; assert.equal(completed,true);
+  });
+  await server.close(); await prisma.$disconnect();
+});

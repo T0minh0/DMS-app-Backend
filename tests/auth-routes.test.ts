@@ -18,6 +18,7 @@ test('authentication routes enforce recovery and rotation boundaries', async t =
     { workerId: 2n, workerName: 'Worker', cpf: Buffer.from('22222222222'), password, userType: '1', cooperative: 2n, authVersion: 0, email: 'b@example.test', recoveryEmail: 'b@example.test', recoveryEmailVerified: false, cooperativeRef: { cooperativeName: 'B' } }
   ];
   const sessions: any[] = [{ id: 'session', workerId: 2n, tokenHash: hashToken('refresh'), authVersion: 0, expiresAt: new Date(Date.now()+100000) }];
+  const refreshTokens: any[] = [{tokenHash:hashToken('refresh'),sessionId:'session',consumedAt:null}];
   const records: any[] = [{ id: 'reset', workerId: 2n, tokenHash: hashToken('reset'), purpose: 'reset', authVersion: 0, attempts: 0, consumedAt: null, expiresAt: new Date(Date.now()+100000) }];
   const counts = new Map<string,number>();
   const fake: any = {
@@ -27,9 +28,20 @@ test('authentication routes enforce recovery and rotation boundaries', async t =
       update: async ({where,data}: any) => { const w = workers.find(w => w.workerId === where.workerId); if (data.authVersion) w.authVersion += data.authVersion.increment; if (data.password) w.password = data.password; return w; }
     },
     authRefreshSession: {
-      findUnique: async ({where}: any) => sessions.find(s => s.tokenHash === where.tokenHash) ?? null,
-      updateMany: async ({where,data}: any) => { const s = sessions.find(x => x.id === where.id && x.tokenHash === where.tokenHash && x.expiresAt > where.expiresAt.gt); if (!s) return { count: 0 }; s.tokenHash = data.tokenHash; return {count: 1}; },
-      deleteMany: async () => ({count: 0}), create: async ({data}: any) => { sessions.push(data); return data; }
+      findUnique: async ({where}: any) => sessions.find(s => where.id ? s.id === where.id : s.tokenHash === where.tokenHash) ?? null,
+      update: async ({where,data}:any) => Object.assign(sessions.find(s => s.id === where.id), data),
+      updateMany: async ({where,data}:any) => { const s = sessions.find(s=>s.id===where.id && !s.revokedAt); if (!s) return {count:0}; Object.assign(s,data); return {count:1}; },
+      create: async ({data}: any) => { sessions.push(data); return data; }
+    },
+    authRefreshToken: {
+      findUnique: async ({where}:any) => refreshTokens.find(s=>s.tokenHash===where.tokenHash) ?? null,
+      update: async ({where,data}:any) => Object.assign(refreshTokens.find(s=>s.tokenHash===where.tokenHash),data),
+      create: async ({data}:any) => { refreshTokens.push({...data,consumedAt:null}); return data; }
+    },
+    authMailOutbox: { create: async ({data}:any) => data },
+    authAttemptLimit: {
+      findUnique: async ({where}:any) => counts.has(where.key) ? {count:counts.get(where.key),expiresAt:new Date(Date.now()+100000)} : null,
+      deleteMany: async ({where}:any) => { counts.delete(where.key); return {count:1}; }
     },
     authRecoveryToken: {
       findUnique: async ({where}: any) => records.find(r => r.tokenHash === where.tokenHash) ?? null,
@@ -40,8 +52,9 @@ test('authentication routes enforce recovery and rotation boundaries', async t =
     }, authAssistanceAudit: { create: async () => ({}) },
     $queryRaw: async (strings: TemplateStringsArray, ...values: any[]) => { if (strings.join('').includes('AuthAttemptLimit')) { const key = values[0]; const count = (counts.get(key) ?? 0)+1; counts.set(key,count); return [{count}]; } return []; }
   };
-  for (const key of ['workers','authRefreshSession','authRecoveryToken','authAssistanceAudit','$queryRaw']) (prisma as any)[key] = fake[key];
-  (prisma as any).$transaction = async (fn: any) => fn(fake);
+  for (const key of ['workers','authRefreshSession','authRefreshToken','authMailOutbox','authAttemptLimit','authRecoveryToken','authAssistanceAudit','$queryRaw']) (prisma as any)[key] = fake[key];
+  let queue = Promise.resolve();
+  (prisma as any).$transaction = async (fn: any) => { const previous = queue; let release!:()=>void; queue = new Promise<void>(resolve=>{ release=resolve; }); await previous; try { return await fn(fake); } finally { release(); } };
   const managerToken = server.jwt.sign({ userId: '1', authVersion: 0 });
   const workerToken = server.jwt.sign({ userId: '2', authVersion: 0 });
   await t.test('two concurrent refreshes consume the old token once', async () => {
@@ -53,8 +66,8 @@ test('authentication routes enforce recovery and rotation boundaries', async t =
     assert.equal(r.statusCode,403); assert.equal(records.filter(x => x.purpose === 'assist').length,0);
   });
   await t.test('unverified email receives no recovery token', async () => {
-    const before = records.length; const r = await server.inject({ method:'POST', url:'/auth/forgot-password', payload:{cpf:'22222222222'} });
-    assert.equal(r.statusCode,200); assert.equal(records.length,before);
+    const before = records.filter(r=>r.workerId===2n && r.purpose==='reset').length; const r = await server.inject({ method:'POST', url:'/auth/forgot-password', payload:{cpf:'22222222222'} });
+    assert.equal(r.statusCode,200); assert.equal(records.filter(r=>r.workerId===2n && r.purpose==='reset').length,before);
   });
   await t.test('reset is single use and revokes legacy and versioned access', async () => {
     const legacy = server.jwt.sign({userId:'2'});

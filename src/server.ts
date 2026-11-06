@@ -4,6 +4,7 @@ import sensible from "@fastify/sensible";
 import jwt from "@fastify/jwt";
 import { ZodError } from "zod";
 import { env } from "./env";
+import { startOutbox } from "./lib/auth/outbox";
 import { prisma } from "./prisma";
 import { recoveryRoutes } from "./routes/recovery";
 import { authRoutes } from "./routes/auth";
@@ -56,6 +57,11 @@ export function buildServer() {
         if ((claim !== undefined && (!Number.isSafeInteger(claim) || claim < 0)) || !/^\d+$/.test(request.user.userId)) throw server.httpErrors.unauthorized();
         const worker = await prisma.workers.findUnique({ where: { workerId: BigInt(request.user.userId) }, select: { authVersion: true } });
         if (!worker || worker.authVersion !== (claim ?? 0)) throw server.httpErrors.unauthorized();
+        if (request.user.sessionVersion === 2) {
+          if (typeof request.user.sid !== 'string') throw server.httpErrors.unauthorized();
+          const session = await prisma.authRefreshSession.findUnique({ where: { id: request.user.sid } });
+          if (!session || session.revokedAt || session.expiresAt <= new Date() || session.workerId !== BigInt(request.user.userId) || session.authVersion !== claim) throw server.httpErrors.unauthorized();
+        } else if (request.user.sessionVersion !== undefined || request.user.sid !== undefined) throw server.httpErrors.unauthorized();
       } catch (error) {
         reply.send(error);
       }
@@ -108,6 +114,9 @@ export function buildServer() {
   });
 
   server.setNotFoundHandler((_request, reply) => reply.status(404).send({ error: "Não encontrado." }));
+
+  const stopOutbox = startOutbox();
+  server.addHook("onClose", async () => { stopOutbox(); });
 
   server.get("/health", async () => ({ status: "ok" }));
 

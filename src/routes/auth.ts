@@ -2,9 +2,9 @@ import { FastifyPluginAsync } from "fastify";
 import { z } from "zod";
 import { prisma } from "../prisma";
 import { compare, hash } from "bcryptjs";
-import { limit, checkLimit, clearLimit } from "./recovery";
+import { limit } from "./recovery";
 import { validNewPassword } from "../lib/auth/password";
-import { makeRefresh } from "../lib/auth/session";
+import { digest, makeRefresh } from "../lib/auth/session";
 import { mapUserTypeToRole } from "../lib/userType";
 
 const loginBodySchema = z.object({
@@ -22,36 +22,34 @@ export const authRoutes: FastifyPluginAsync = async (server) => {
     "/login",
     async (request, reply) => {
       const { cpf, password, sessionVersion } = loginBodySchema.parse(request.body);
-      const allowed = await Promise.all([checkLimit(`login:cpf:${cpf}`, 10), limit(`login:ip:${request.ip}`, 100, 900)]);
-      if (!allowed.every(Boolean)) throw server.httpErrors.tooManyRequests("Muitas tentativas. Tente mais tarde.");
-      const worker = await prisma.workers.findFirst({
-        where: { cpf: Buffer.from(cpf, "utf-8") },
-        select: {
-          workerId: true,
-          workerName: true,
-          email: true,
-          cpf: true,
-          password: true,
-          authVersion: true,
-          userType: true,
-          cooperative: true,
-          cooperativeRef: {
-            select: {
-              cooperativeId: true,
-              cooperativeName: true
-            }
-          }
+      if (!await limit(`login:ip:${request.ip}`, 100, 900)) throw server.httpErrors.tooManyRequests("Muitas tentativas. Tente mais tarde.");
+      const key = digest(`login:cpf:${cpf}`);
+      // The transaction-scoped advisory lock serializes password checks for the
+      // same account across API instances. No guess can run past its budget.
+      const result = await prisma.$transaction(async tx => {
+        await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${key}, 0))`;
+        const now = new Date();
+        const failure = await tx.authAttemptLimit.findUnique({where:{key}});
+        if (failure && failure.expiresAt > now && failure.count >= 10) return {status:'limited' as const};
+        const worker = await tx.workers.findFirst({
+          where: { cpf: Buffer.from(cpf, "utf-8") },
+          select: { workerId:true, workerName:true, email:true, cpf:true, password:true, authVersion:true, userType:true, cooperative:true, cooperativeRef:{select:{cooperativeId:true,cooperativeName:true}} }
+        });
+        const passwordHash = worker?.password ? Buffer.from(worker.password).toString("utf-8") : '$2a$10$7EqJtq98hPqEX7fNZaFWoO5uG9KWSJ3TXwKEt5S9tMyYXtFMwJDpa';
+        const valid = await compare(password, passwordHash);
+        if (!worker || !worker.password || !valid) {
+          const until = new Date(now.getTime() + 900_000);
+          await tx.$queryRaw`INSERT INTO "AuthAttemptLimit" ("key", "count", "expiresAt") VALUES (${key}, 1, (${until}::timestamptz AT TIME ZONE 'UTC'))
+            ON CONFLICT ("key") DO UPDATE SET "count" = CASE WHEN "AuthAttemptLimit"."expiresAt" <= (${now}::timestamptz AT TIME ZONE 'UTC') THEN 1 ELSE "AuthAttemptLimit"."count" + 1 END,
+            "expiresAt" = CASE WHEN "AuthAttemptLimit"."expiresAt" <= (${now}::timestamptz AT TIME ZONE 'UTC') THEN (${until}::timestamptz AT TIME ZONE 'UTC') ELSE "AuthAttemptLimit"."expiresAt" END RETURNING "count"`;
+          return {status:'invalid' as const};
         }
-      });
-
-      const passwordHash = worker?.password ? Buffer.from(worker.password).toString("utf-8") : '$2a$10$7EqJtq98hPqEX7fNZaFWoO5uG9KWSJ3TXwKEt5S9tMyYXtFMwJDpa';
-      const isValidPassword = await compare(password, passwordHash);
-      if (!worker || !worker.password || !isValidPassword) {
-        await limit(`login:cpf:${cpf}`, 10, 900);
-        throw server.httpErrors.unauthorized("Credenciais inválidas.");
-      }
-
-      await clearLimit(`login:cpf:${cpf}`);
+        await tx.authAttemptLimit.deleteMany({where:{key}});
+        return {status:'ok' as const,worker};
+      }, {maxWait:15_000, timeout:15_000});
+      if (result.status === 'limited') throw server.httpErrors.tooManyRequests("Muitas tentativas. Tente mais tarde.");
+      if (result.status === 'invalid') throw server.httpErrors.unauthorized("Credenciais inválidas.");
+      const worker = result.worker;
       const session = sessionVersion === 2 ? await makeRefresh(worker.workerId, worker.authVersion) : undefined;
       const token = await server.jwt.sign({
         userId: worker.workerId.toString(), authVersion: worker.authVersion,

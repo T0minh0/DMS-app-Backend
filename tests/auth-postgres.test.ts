@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import { strict as assert } from 'node:assert';
-import { createHash, randomUUID } from 'node:crypto';
+import { createHash, createHmac, randomUUID } from 'node:crypto';
 import { hash, compare } from 'bcryptjs';
 
 const database = process.env.AUTH_TEST_DATABASE_URL;
@@ -11,6 +11,7 @@ test('isolated PostgreSQL authentication regressions', { skip: !safe }, async t 
   process.env.DATABASE_URL = database!;
   process.env.JWT_SECRET = 'test-secret-with-at-least-32-characters';
   process.env.NODE_ENV = 'test';
+  process.env.AUTH_PROXY_SECRET = 'shared-test-secret-at-least-32-characters';
   process.env.RESEND_API_KEY = 'test-only'; process.env.RECOVERY_EMAIL_FROM = 'test@example.test'; process.env.RECOVERY_WEB_URL = 'https://example.test';
   const { prisma } = await import('../src/prisma'); const { buildServer } = await import('../src/server');
   await prisma.authRecoveryToken.deleteMany(); await prisma.authRefreshToken.deleteMany(); await prisma.authRefreshSession.deleteMany(); await prisma.authMailOutbox.deleteMany(); await prisma.authAttemptLimit.deleteMany();
@@ -32,6 +33,24 @@ test('isolated PostgreSQL authentication regressions', { skip: !safe }, async t 
     const s = await login(); const responses = await Promise.all([1,2].map(()=>server.inject({method:'POST',url:'/auth/refresh',payload:{refreshToken:s.refreshToken}})));
     assert.deepEqual(responses.map(r=>r.statusCode).sort(),[200,401]); const success = responses.find(r=>r.statusCode===200)!.json();
     assert.equal((await me(success.accessToken)).statusCode,401); assert.equal((await server.inject({method:'POST',url:'/auth/refresh',payload:{refreshToken:success.refreshToken}})).statusCode,401);
+  });
+  await t.test('concurrent bad logins cannot bypass the account failure budget', async () => {
+    await prisma.authAttemptLimit.deleteMany();
+    const responses = await Promise.all(Array.from({length:20},()=>server.inject({method:'POST',url:'/auth/login',payload:{cpf:'99999999999',password:'wrong'}})));
+    assert.equal(responses.filter(r=>r.statusCode===401).length,10);
+    assert.equal(responses.filter(r=>r.statusCode===429).length,10);
+    const accountKey = digest('login:cpf:99999999999');
+    await prisma.authAttemptLimit.update({where:{key:accountKey},data:{expiresAt:new Date(Date.now()-1000)}});
+    assert.equal((await server.inject({method:'POST',url:'/auth/login',payload:{cpf:'99999999999',password:'wrong'}})).statusCode,401);
+    assert.equal((await prisma.authAttemptLimit.findUnique({where:{key:accountKey}}))?.count,1);
+    assert.equal((await server.inject({method:'POST',url:'/auth/login',payload:{cpf:'33333333333',password:'initial-pass'}})).statusCode,200);
+  });
+  await t.test('signed forwarded client addresses receive separate source budgets', async () => {
+    await prisma.authAttemptLimit.deleteMany(); const key=process.env.AUTH_PROXY_SECRET!; const now=String(Math.floor(Date.now()/1000));
+    const headers = (ip:string) => ({'x-dms-client-ip':ip,'x-dms-client-time':now,'x-dms-client-signature':createHmac('sha256',key).update(`${now}\nPOST\n/auth/forgot-password\n${ip}`).digest('hex')});
+    for (const [cpf,ip] of [['00000000001','192.0.2.1'],['00000000002','192.0.2.2']]) assert.equal((await server.inject({method:'POST',url:'/auth/forgot-password',headers:headers(ip),payload:{cpf}})).statusCode,200);
+    const one=await prisma.authAttemptLimit.findUnique({where:{key:digest('forgot:ip:192.0.2.1')}}); const two=await prisma.authAttemptLimit.findUnique({where:{key:digest('forgot:ip:192.0.2.2')}});
+    assert.equal(one?.count,1); assert.equal(two?.count,1);
   });
   await t.test('successful logins do not spend the account failure budget', async () => {
     for (let i=0; i<11; i++) { const r = await server.inject({method:'POST',url:'/auth/login',payload:{cpf:'33333333333',password:'initial-pass'}}); assert.equal(r.statusCode,200); }

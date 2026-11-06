@@ -50,6 +50,7 @@ test('authentication routes enforce recovery and rotation boundaries', async t =
       update: async ({where,data}: any) => Object.assign(records.find(r => r.id === where.id), data),
       create: async ({data}: any) => { records.push({...data, attempts:0, consumedAt:null}); return data; }
     }, authAssistanceAudit: { create: async () => ({}) },
+    $executeRaw: async () => 0,
     $queryRaw: async (strings: TemplateStringsArray, ...values: any[]) => { if (strings.join('').includes('AuthAttemptLimit')) { const key = values[0]; const count = (counts.get(key) ?? 0)+1; counts.set(key,count); return [{count}]; } return []; }
   };
   for (const key of ['workers','authRefreshSession','authRefreshToken','authMailOutbox','authAttemptLimit','authRecoveryToken','authAssistanceAudit','$queryRaw']) (prisma as any)[key] = fake[key];

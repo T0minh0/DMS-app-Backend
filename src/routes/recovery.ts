@@ -16,16 +16,11 @@ const refreshSchema = z.object({ refreshToken: z.string().min(1).max(256) });
 export async function limit(key: string, maximum: number, seconds: number) {
   const id = digest(key); const now = new Date(); const until = new Date(now.getTime() + seconds * 1000);
   const rows = await prisma.$queryRaw<Array<{count: number}>>`
-    INSERT INTO "AuthAttemptLimit" ("key", "count", "expiresAt") VALUES (${id}, 1, ${until})
-    ON CONFLICT ("key") DO UPDATE SET "count" = CASE WHEN "AuthAttemptLimit"."expiresAt" <= ${now} THEN 1 ELSE "AuthAttemptLimit"."count" + 1 END,
-    "expiresAt" = CASE WHEN "AuthAttemptLimit"."expiresAt" <= ${now} THEN ${until} ELSE "AuthAttemptLimit"."expiresAt" END RETURNING "count"`;
+    INSERT INTO "AuthAttemptLimit" ("key", "count", "expiresAt") VALUES (${id}, 1, (${until}::timestamptz AT TIME ZONE 'UTC'))
+    ON CONFLICT ("key") DO UPDATE SET "count" = CASE WHEN "AuthAttemptLimit"."expiresAt" <= (${now}::timestamptz AT TIME ZONE 'UTC') THEN 1 ELSE "AuthAttemptLimit"."count" + 1 END,
+    "expiresAt" = CASE WHEN "AuthAttemptLimit"."expiresAt" <= (${now}::timestamptz AT TIME ZONE 'UTC') THEN (${until}::timestamptz AT TIME ZONE 'UTC') ELSE "AuthAttemptLimit"."expiresAt" END RETURNING "count"`;
   return rows[0].count <= maximum;
 }
-export async function checkLimit(key: string, maximum: number) {
-  const row = await prisma.authAttemptLimit.findUnique({where:{key:digest(key)}});
-  return !row || row.expiresAt <= new Date() || row.count < maximum;
-}
-export async function clearLimit(key: string) { await prisma.authAttemptLimit.deleteMany({where:{key:digest(key)}}); }
 const userSelect = { workerId: true, workerName: true, email: true, cpf: true, userType: true, cooperative: true, cooperativeRef: { select: { cooperativeName: true } } } as const;
 function userObject(w: any) { return { id: String(w.workerId), name: w.workerName, email: w.email, cpf: Buffer.from(w.cpf).toString('utf8'), userType: mapUserTypeToRole(w.userType), cooperativeId: String(w.cooperative), cooperativeName: w.cooperativeRef?.cooperativeName ?? null }; }
 export const recoveryRoutes: FastifyPluginAsync = async server => {

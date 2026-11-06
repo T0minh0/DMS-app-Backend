@@ -1,5 +1,6 @@
 import { config } from "dotenv";
 import { z } from "zod";
+import { parseTrustedProxyCidrs } from "./lib/auth/trusted-proxies";
 
 config();
 
@@ -18,6 +19,9 @@ const envSchema = z.object({
     .string()
     .min(1, "DATABASE_URL is required"),
   SHADOW_DATABASE_URL: z.string().optional(),
+  DMS_TRUSTED_PROXY_CIDRS: z.string().optional().refine(value => {
+    try { parseTrustedProxyCidrs(value); return true; } catch { return false; }
+  }, "DMS_TRUSTED_PROXY_CIDRS must contain explicit valid IP addresses or CIDRs, without /0"),
   AUTH_PROXY_SECRET: z.string().min(32).optional(),
   RESEND_API_KEY: z.string().min(1).optional(),
   RECOVERY_EMAIL_FROM: z.string().min(1).optional(),

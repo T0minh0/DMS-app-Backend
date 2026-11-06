@@ -14,3 +14,9 @@ test('trusted forwarding requires a current signature over canonical IP, method 
   assert.equal(clientIp({...request,headers:{...headers,'x-dms-client-signature':'0'.repeat(64)}},secret,1800000000),'127.0.0.1');
   assert.equal(clientIp(request,undefined,1800000000),'127.0.0.1');
 });
+
+test('accepts the newline-delimited signing format used by the web proxy', () => {
+  const key='a'.repeat(32), now=1770000000, ip='203.0.113.89', path='/auth/forgot-password';
+  const signature=createHmac('sha256',key).update([String(now),'POST',path,ip].join(String.fromCharCode(10))).digest('hex');
+  assert.equal(clientIp({ip:'10.0.1.6',method:'POST',url:path,headers:{'x-dms-client-ip':ip,'x-dms-client-time':String(now),'x-dms-client-signature':signature}},key,now),ip);
+});

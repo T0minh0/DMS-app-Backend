@@ -4,6 +4,7 @@ import sensible from "@fastify/sensible";
 import jwt from "@fastify/jwt";
 import { ZodError } from "zod";
 import { env } from "./env";
+import { parseTrustedProxyCidrs } from "./lib/auth/trusted-proxies";
 import { startOutbox } from "./lib/auth/outbox";
 import { prisma } from "./prisma";
 import { recoveryRoutes } from "./routes/recovery";
@@ -17,8 +18,9 @@ import { gamificationRoutes } from "./routes/gamification";
 import { workersRoutes } from "./routes/workers";
 import { pushRoutes } from "./routes/push";
 
-export function buildServer() {
+export function buildServer(trustedProxyCidrs = env.DMS_TRUSTED_PROXY_CIDRS) {
   const server = Fastify({
+    trustProxy: parseTrustedProxyCidrs(trustedProxyCidrs),
     disableRequestLogging: true,
     logger:
       env.NODE_ENV === "production"

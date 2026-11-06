@@ -115,15 +115,42 @@ export const recoveryRoutes: FastifyPluginAsync = async (server) => {
     };
   });
   server.post("/logout", async (req) => {
-    const { refreshToken } = refreshSchema.parse(req.body);
-    const token = await prisma.authRefreshToken.findUnique({
-      where: { tokenHash: digest(refreshToken) },
-    });
-    if (token)
-      await prisma.authRefreshSession.updateMany({
-        where: { id: token.sessionId, revokedAt: null },
-        data: { revokedAt: new Date() },
+    const { refreshToken, pushTokens } = refreshSchema
+      .extend({
+        pushTokens: z
+          .array(z.string().trim().min(1).max(4096))
+          .max(32)
+          .optional(),
+      })
+      .parse(req.body);
+    // Revocation remains authorized by refresh lineage, including consumed
+    // credentials and password-version changes. Never borrow access JWT auth.
+    await prisma.$transaction(async (tx) => {
+      const token = await tx.authRefreshToken.findUnique({
+        where: { tokenHash: digest(refreshToken) },
       });
+      if (!token) return;
+      await tx.$queryRaw`SELECT "id" FROM "AuthRefreshSession" WHERE "id" = ${token.sessionId} FOR UPDATE`;
+      const session = await tx.authRefreshSession.findUnique({
+        where: { id: token.sessionId },
+      });
+      if (!session) return;
+      const revokedAt = session.revokedAt ?? new Date();
+      if (!session.revokedAt)
+        await tx.authRefreshSession.update({
+          where: { id: session.id },
+          data: { revokedAt },
+        });
+      if (pushTokens?.length)
+        await tx.workerPushToken.deleteMany({
+          where: {
+            workerId: session.workerId,
+            token: { in: pushTokens },
+            // A repeated old logout must not erase a later same-account binding.
+            lastSeen: { lte: revokedAt },
+          },
+        });
+    });
     return { message: "Sessão encerrada." };
   });
   server.post("/forgot-password", async (req) => {

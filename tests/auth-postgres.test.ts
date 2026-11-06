@@ -7,7 +7,7 @@ const database = process.env.AUTH_TEST_DATABASE_URL;
 // These fixtures reset authentication state. Reject non-local or durable targets.
 if (database) {
   const target = new URL(database);
-  if (!['localhost', '127.0.0.1', '[::1]'].includes(target.hostname) || !/(?:test|scratch|disposable)/i.test(target.pathname)) {
+  if (!['localhost', '127.0.0.1', '[::1]'].includes(target.hostname) || !/(?:test|scratch|disposable|migration)/i.test(target.pathname)) {
     throw new Error('AUTH_TEST_DATABASE_URL must name a disposable local test database.');
   }
 }
@@ -61,6 +61,86 @@ test('isolated PostgreSQL authentication regressions', { skip: !safe }, async t 
   await t.test('logout revokes access already issued to this session', async () => {
     const s = await login(); await server.inject({method:'POST',url:'/auth/logout',payload:{refreshToken:s.refreshToken}}); assert.equal((await me(s.accessToken)).statusCode,401);
   });
+  await t.test('logout cleans only named owned push bindings with an expired bearer', async () => {
+    const session = await login();
+    const other = await prisma.workers.findFirstOrThrow({where:{workerName:'Auth manager'}});
+    await prisma.workerPushToken.createMany({data:[
+      {workerId:worker.workerId,token:'logout-current-device',platform:'android'},
+      {workerId:worker.workerId,token:'logout-other-device',platform:'android'},
+      {workerId:other.workerId,token:'logout-foreign-device',platform:'android'}
+    ]});
+    const expired = server.jwt.sign({userId:String(worker.workerId),authVersion:0},{expiresIn:'-1s'});
+    assert.equal((await server.inject({method:'DELETE',url:'/devices/push-token',headers:{authorization:`Bearer ${expired}`},payload:{token:'logout-current-device'}})).statusCode,401);
+    const response = await server.inject({method:'POST',url:'/auth/logout',headers:{authorization:`Bearer ${expired}`},payload:{refreshToken:session.refreshToken,pushTokens:['logout-current-device','logout-foreign-device']}});
+    assert.equal(response.statusCode,200);
+    assert.equal(await prisma.workerPushToken.findUnique({where:{token:'logout-current-device'}}),null);
+    assert.ok(await prisma.workerPushToken.findUnique({where:{token:'logout-other-device'}}));
+    assert.ok(await prisma.workerPushToken.findUnique({where:{token:'logout-foreign-device'}}));
+    await prisma.workerPushToken.deleteMany({where:{token:{startsWith:'logout-'}}});
+  });
+  await t.test('logout cleans push after password change invalidates the access and refresh versions', async () => {
+    const session = await login();
+    const beforePasswordChange = await prisma.workers.findUniqueOrThrow({where:{workerId:worker.workerId}});
+    await prisma.workerPushToken.create({data:{workerId:worker.workerId,token:'password-change-device',platform:'android'}});
+    assert.equal((await server.inject({method:'PUT',url:'/auth/me',headers:{authorization:`Bearer ${session.accessToken}`},payload:{currentPassword:'initial-pass',newPassword:'58290417'}})).statusCode,200);
+    assert.equal((await me(session.accessToken)).statusCode,401);
+    const response = await server.inject({method:'POST',url:'/auth/logout',payload:{refreshToken:session.refreshToken,pushTokens:['password-change-device']}});
+    assert.equal(response.statusCode,200);
+    const binding = await prisma.workerPushToken.findUnique({where:{token:'password-change-device'}});
+    await prisma.workers.update({where:{workerId:worker.workerId},data:{password,authVersion:beforePasswordChange.authVersion}});
+    await prisma.workerPushToken.deleteMany({where:{token:'password-change-device'}});
+    assert.equal(binding,null);
+  });
+  await t.test('replayed logout cannot delete a later registration by the same account', async () => {
+    const old = await login();
+    await prisma.workerPushToken.create({data:{workerId:worker.workerId,token:'same-account-device',platform:'android'}});
+    await server.inject({method:'POST',url:'/auth/logout',payload:{refreshToken:old.refreshToken,pushTokens:['same-account-device']}});
+    const successor = await login();
+    const fresh = await server.inject({method:'POST',url:'/devices/push-token',headers:{authorization:`Bearer ${successor.accessToken}`},payload:{token:'same-account-device',platform:'android'}});
+    assert.equal(fresh.statusCode,200);
+    await server.inject({method:'POST',url:'/auth/logout',payload:{refreshToken:old.refreshToken,pushTokens:['same-account-device']}});
+    assert.ok(await prisma.workerPushToken.findUnique({where:{token:'same-account-device'}}));
+    assert.equal((await me(successor.accessToken)).statusCode,200);
+    await prisma.workerPushToken.deleteMany({where:{token:'same-account-device'}});
+  });
+  for (const invalidation of ['logout', 'replay', 'password'] as const) {
+    await t.test(`registration authenticated before ${invalidation} cannot commit after invalidation`, async () => {
+      const old = await login();
+      const originalVersion = (await prisma.workers.findUniqueOrThrow({where:{workerId:worker.workerId}})).authVersion;
+      if (invalidation === 'replay') assert.equal((await server.inject({method:'POST',url:'/auth/refresh',payload:{refreshToken:old.refreshToken}})).statusCode,200);
+      const original = prisma.authRefreshSession.findUnique.bind(prisma.authRefreshSession);
+      let start!:()=>void; let release!:()=>void; let paused = false;
+      const started = new Promise<void>(resolve=>{start=resolve;});
+      const gate = new Promise<void>(resolve=>{release=resolve;});
+      (prisma.authRefreshSession as any).findUnique = async (args:any) => {
+        const snapshot = await original(args);
+        if (!paused) { paused=true; start(); await gate; }
+        return snapshot;
+      };
+      const pending = server.inject({method:'POST',url:'/devices/push-token',headers:{authorization:`Bearer ${old.accessToken}`},payload:{token:'delayed-device',platform:'android'}});
+      try {
+        await started;
+        if (invalidation === 'logout') {
+          await server.inject({method:'POST',url:'/auth/logout',payload:{refreshToken:old.refreshToken,pushTokens:['delayed-device']}});
+          const other = await prisma.workers.findFirstOrThrow({where:{workerName:'Auth manager'}});
+          await prisma.workerPushToken.create({data:{workerId:other.workerId,token:'delayed-device',platform:'android'}});
+        } else if (invalidation === 'replay') {
+          assert.equal((await server.inject({method:'POST',url:'/auth/refresh',payload:{refreshToken:old.refreshToken}})).statusCode,401);
+        } else {
+          await prisma.workers.update({where:{workerId:worker.workerId},data:{authVersion:{increment:1}}});
+        }
+        release(); const result = await pending;
+        assert.equal(result.statusCode,401);
+        const binding = await prisma.workerPushToken.findUnique({where:{token:'delayed-device'}});
+        if (invalidation === 'logout') assert.notEqual(binding?.workerId,worker.workerId);
+        else assert.equal(binding,null);
+      } finally {
+        release(); await pending; (prisma.authRefreshSession as any).findUnique=original;
+        await prisma.workerPushToken.deleteMany({where:{token:'delayed-device'}});
+        await prisma.workers.update({where:{workerId:worker.workerId},data:{authVersion:originalVersion}});
+      }
+    });
+  }
   await t.test('refresh replay revokes the successor session', async () => {
     const s = await login(); const rotate = (token:string) => server.inject({method:'POST',url:'/auth/refresh',payload:{refreshToken:token}});
     const first = await rotate(s.refreshToken); assert.equal(first.statusCode,200); const successor = first.json(); assert.equal((await rotate(s.refreshToken)).statusCode,401); assert.equal((await rotate(successor.refreshToken)).statusCode,401); assert.equal((await me(successor.accessToken)).statusCode,401);

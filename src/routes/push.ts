@@ -12,47 +12,67 @@ import { prisma } from "../prisma";
 
 const pushTokenBodySchema = z.object({
   token: z.string().trim().min(1, "Token invalido."),
-  platform: z.enum(["ios", "android"])
+  platform: z.enum(["ios", "android"]),
 });
 
 const deletePushTokenBodySchema = z.object({
-  token: z.string().trim().min(1, "Token invalido.")
+  token: z.string().trim().min(1, "Token invalido."),
 });
 
 export const pushRoutes: FastifyPluginAsync = async (server) => {
   server.post(
     "/push-token",
     {
-      preHandler: [server.authenticate]
+      preHandler: [server.authenticate],
     },
     async (request) => {
       const workerId = BigInt(request.user.userId);
       const body = pushTokenBodySchema.parse(request.body);
 
-      // Upsert por token. Se o token ja existir vinculado a outro worker,
-      // transfere para o atual (usuario trocou de conta no mesmo device).
-      await prisma.workerPushToken.upsert({
-        where: { token: body.token },
-        update: {
-          workerId,
-          platform: body.platform,
-          lastSeen: new Date()
-        },
-        create: {
-          workerId,
-          token: body.token,
-          platform: body.platform
+      await prisma.$transaction(async (tx) => {
+        // Use the same worker -> session lock order as credential recovery.
+        // Authentication may have completed before logout/password revocation;
+        // recheck ownership and version inside the transaction that commits push.
+        await tx.$queryRaw`SELECT "Worker_id" FROM "Workers" WHERE "Worker_id" = ${workerId} FOR UPDATE`;
+        const worker = await tx.workers.findUnique({
+          where: { workerId },
+          select: { authVersion: true },
+        });
+        if (!worker || worker.authVersion !== (request.user.authVersion ?? 0))
+          throw server.httpErrors.unauthorized("Sessão inválida.");
+        if (request.user.sessionVersion === 2) {
+          const sid = request.user.sid;
+          if (!sid) throw server.httpErrors.unauthorized("Sessão inválida.");
+          await tx.$queryRaw`SELECT "id" FROM "AuthRefreshSession" WHERE "id" = ${sid} FOR UPDATE`;
+          const session = await tx.authRefreshSession.findUnique({
+            where: { id: sid },
+          });
+          if (
+            !session ||
+            session.revokedAt ||
+            session.expiresAt <= new Date() ||
+            session.workerId !== workerId ||
+            session.authVersion !== worker.authVersion
+          )
+            throw server.httpErrors.unauthorized("Sessão inválida.");
         }
+        // Legacy JWTs have no revocable session row; retain version-checked
+        // registration for old clients. All new mobile logins request v2.
+        await tx.workerPushToken.upsert({
+          where: { token: body.token },
+          update: { workerId, platform: body.platform, lastSeen: new Date() },
+          create: { workerId, token: body.token, platform: body.platform },
+        });
       });
 
       return { status: "ok" };
-    }
+    },
   );
 
   server.delete(
     "/push-token",
     {
-      preHandler: [server.authenticate]
+      preHandler: [server.authenticate],
     },
     async (request) => {
       const workerId = BigInt(request.user.userId);
@@ -63,11 +83,11 @@ export const pushRoutes: FastifyPluginAsync = async (server) => {
       await prisma.workerPushToken.deleteMany({
         where: {
           token: body.token,
-          workerId
-        }
+          workerId,
+        },
       });
 
       return { status: "ok" };
-    }
+    },
   );
 };

@@ -447,6 +447,7 @@ model AuthAttemptLimit {
 }
 
 model AuthAssistanceAudit {
+  cooperativeId BigInt?
   id String @id
   managerId BigInt
   workerId BigInt

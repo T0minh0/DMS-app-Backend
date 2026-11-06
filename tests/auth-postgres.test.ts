@@ -14,14 +14,42 @@ test('isolated PostgreSQL authentication regressions', { skip: !safe }, async t 
   process.env.AUTH_PROXY_SECRET = 'shared-test-secret-at-least-32-characters';
   process.env.RESEND_API_KEY = 'test-only'; process.env.RECOVERY_EMAIL_FROM = 'test@example.test'; process.env.RECOVERY_WEB_URL = 'https://example.test';
   const { prisma } = await import('../src/prisma'); const { buildServer } = await import('../src/server');
-  await prisma.authRecoveryToken.deleteMany(); await prisma.authRefreshToken.deleteMany(); await prisma.authRefreshSession.deleteMany(); await prisma.authMailOutbox.deleteMany(); await prisma.authAttemptLimit.deleteMany();
-  await prisma.workers.deleteMany({ where: { workerName: 'Auth test' } }); await prisma.cooperative.deleteMany({ where: { cooperativeName: 'Auth test' } });
+  await prisma.authAssistanceAudit.deleteMany(); await prisma.authRecoveryToken.deleteMany(); await prisma.authRefreshToken.deleteMany(); await prisma.authRefreshSession.deleteMany(); await prisma.authMailOutbox.deleteMany(); await prisma.authAttemptLimit.deleteMany();
+  await prisma.workers.deleteMany({ where: { workerName: { in: ['Auth test', 'Auth manager'] } } }); await prisma.cooperative.deleteMany({ where: { cooperativeName: 'Auth test' } });
   const coop = await prisma.cooperative.create({ data:{cooperativeName:'Auth test'} });
   const password = Buffer.from(await hash('initial-pass', 4));
   const worker = await prisma.workers.create({ data:{workerName:'Auth test',cooperative:coop.cooperativeId,cpf:Buffer.from('33333333333'),userType:'1',birthDate:new Date('2000-01-01'),enterDate:new Date('2020-01-01'),pis:Buffer.from('0'),rg:Buffer.from('0'),password,email:'x@example.test',recoveryEmail:'old@example.test',recoveryEmailVerified:true} });
   const server = buildServer(); await server.ready();
   const login = async () => { const r = await server.inject({method:'POST',url:'/auth/login',payload:{cpf:'33333333333',password:'initial-pass',sessionVersion:2}}); assert.equal(r.statusCode,200); return r.json(); };
   const me = (token: string) => server.inject({method:'GET',url:'/auth/me',headers:{authorization:`Bearer ${token}`}});
+  await t.test('login, refresh and profile save preserve verified recovery metadata', async () => {
+    const session = await login();
+    assert.equal(session.user.recoveryEmail,'old@example.test'); assert.equal(session.user.recoveryEmailVerified,true);
+    const profile = await me(session.accessToken); assert.equal(profile.json().recoveryEmail,'old@example.test'); assert.equal(profile.json().recoveryEmailVerified,true);
+    const changed = await server.inject({method:'PUT',url:'/auth/me',headers:{authorization:`Bearer ${session.accessToken}`},payload:{name:'Auth test revised'}});
+    assert.equal(changed.statusCode,200); assert.equal(changed.json().user.recoveryEmail,'old@example.test'); assert.equal(changed.json().user.recoveryEmailVerified,true);
+    const unchanged = await server.inject({method:'PUT',url:'/auth/me',headers:{authorization:`Bearer ${session.accessToken}`},payload:{}});
+    assert.equal(unchanged.statusCode,200); assert.equal(unchanged.json().user.recoveryEmail,'old@example.test'); assert.equal(unchanged.json().user.recoveryEmailVerified,true);
+    const refreshed = await server.inject({method:'POST',url:'/auth/refresh',payload:{refreshToken:session.refreshToken}});
+    assert.equal(refreshed.statusCode,200); assert.equal(refreshed.json().user.recoveryEmail,'old@example.test'); assert.equal(refreshed.json().user.recoveryEmailVerified,true);
+    await prisma.workers.update({where:{workerId:worker.workerId},data:{workerName:'Auth test'}});
+  });
+  await t.test('assisted recovery audit snapshots the cooperative', async () => {
+    const manager = await prisma.workers.create({data:{workerName:'Auth manager',cooperative:coop.cooperativeId,cpf:Buffer.from('00000000999'),userType:'0',birthDate:new Date('2000-01-01'),enterDate:new Date('2020-01-01'),pis:Buffer.from('0'),rg:Buffer.from('0'),password,email:'manager@example.test'}});
+    const response = await server.inject({method:'POST',url:'/auth/login',payload:{cpf:'00000000999',password:'initial-pass',sessionVersion:2}}); assert.equal(response.statusCode,200); assert.equal(response.json().user.recoveryEmail,null); assert.equal(response.json().user.recoveryEmailVerified,false);
+    const managerAccess = response.json().accessToken; const managerHeaders = {authorization:`Bearer ${managerAccess}`};
+    const managerProfile = await server.inject({method:'PUT',url:'/auth/me',headers:managerHeaders,payload:{name:'Auth manager'}});
+    assert.equal(managerProfile.json().user.recoveryEmail,null); assert.equal(managerProfile.json().user.recoveryEmailVerified,false);
+    const managerRefresh = await server.inject({method:'POST',url:'/auth/refresh',payload:{refreshToken:response.json().refreshToken}});
+    assert.equal(managerRefresh.json().user.recoveryEmail,null); assert.equal(managerRefresh.json().user.recoveryEmailVerified,false);
+    const assisted = await server.inject({method:'POST',url:'/auth/assisted-recovery',headers:{authorization:`Bearer ${response.json().accessToken}`},payload:{workerId:String(worker.workerId),currentPassword:'initial-pass',reason:'Solicitou ajuda'}}); assert.equal(assisted.statusCode,200);
+    const audit = await prisma.authAssistanceAudit.findFirst({where:{managerId:manager.workerId,workerId:worker.workerId}});
+    assert.equal((audit as unknown as {cooperativeId:bigint}|null)?.cooperativeId,coop.cooperativeId);
+    const other = await prisma.cooperative.create({data:{cooperativeName:'Auth snapshot transfer'}});
+    await prisma.workers.update({where:{workerId:worker.workerId},data:{cooperative:other.cooperativeId}});
+    const saved = await prisma.authAssistanceAudit.findUniqueOrThrow({where:{id:audit!.id}}); assert.equal(saved.cooperativeId,coop.cooperativeId);
+    await prisma.workers.update({where:{workerId:worker.workerId},data:{cooperative:coop.cooperativeId}}); await prisma.cooperative.delete({where:{cooperativeId:other.cooperativeId}});
+  });
   await t.test('logout revokes access already issued to this session', async () => {
     const s = await login(); await server.inject({method:'POST',url:'/auth/logout',payload:{refreshToken:s.refreshToken}}); assert.equal((await me(s.accessToken)).statusCode,401);
   });

@@ -4,6 +4,14 @@ import { createHash, createHmac, randomUUID } from 'node:crypto';
 import { hash, compare } from 'bcryptjs';
 
 const database = process.env.AUTH_TEST_DATABASE_URL;
+// These fixtures reset authentication state. Reject non-local or durable targets.
+if (database) {
+  const target = new URL(database);
+  if (!['localhost', '127.0.0.1', '[::1]'].includes(target.hostname) || !/(?:test|scratch|disposable)/i.test(target.pathname)) {
+    throw new Error('AUTH_TEST_DATABASE_URL must name a disposable local test database.');
+  }
+}
+
 const safe = ['postgresql://cammis@127.0.0.1:55491/dms_auth_test', 'postgresql://cammis@127.0.0.1:55491/dms_auth_migration'].includes(database ?? '');
 const digest = (s: string) => createHash('sha256').update(s).digest('hex');
 

@@ -4,6 +4,8 @@ import sensible from "@fastify/sensible";
 import jwt from "@fastify/jwt";
 import { ZodError } from "zod";
 import { env } from "./env";
+import { prisma } from "./prisma";
+import { recoveryRoutes } from "./routes/recovery";
 import { authRoutes } from "./routes/auth";
 import { weighingsRoutes } from "./routes/weighings";
 import { leaderboardRoutes } from "./routes/leaderboard";
@@ -16,6 +18,7 @@ import { pushRoutes } from "./routes/push";
 
 export function buildServer() {
   const server = Fastify({
+    disableRequestLogging: true,
     logger:
       env.NODE_ENV === "production"
         ? true
@@ -49,6 +52,10 @@ export function buildServer() {
     async function (request, reply) {
       try {
         await request.jwtVerify();
+        const claim = request.user.authVersion;
+        if ((claim !== undefined && (!Number.isSafeInteger(claim) || claim < 0)) || !/^\d+$/.test(request.user.userId)) throw server.httpErrors.unauthorized();
+        const worker = await prisma.workers.findUnique({ where: { workerId: BigInt(request.user.userId) }, select: { authVersion: true } });
+        if (!worker || worker.authVersion !== (claim ?? 0)) throw server.httpErrors.unauthorized();
       } catch (error) {
         reply.send(error);
       }
@@ -100,9 +107,12 @@ export function buildServer() {
     });
   });
 
+  server.setNotFoundHandler((_request, reply) => reply.status(404).send({ error: "Não encontrado." }));
+
   server.get("/health", async () => ({ status: "ok" }));
 
   void server.register(authRoutes, { prefix: "/auth" });
+  void server.register(recoveryRoutes, { prefix: "/auth" });
   void server.register(materialsRoutes, { prefix: "/materials" });
   void server.register(weighingsRoutes, { prefix: "/weighings" });
   void server.register(leaderboardRoutes, { prefix: "/leaderboard" });

@@ -12,9 +12,11 @@ declare module "@fastify/jwt" {
   interface FastifyJWT {
     payload: {
       userId: string;
+      authVersion?: number;
     };
     user: {
       userId: string;
+      authVersion?: number;
     };
   }
 }

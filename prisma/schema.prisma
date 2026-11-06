@@ -112,6 +112,9 @@ model Workers {
   pis                         Bytes                   @map("PIS")
   rg                          Bytes                   @map("RG")
   gender                      String?                 @map("Gender")
+  authVersion                 Int                     @default(0)
+  recoveryEmail               String?
+  recoveryEmailVerified       Boolean                 @default(false)
   password                    Bytes                   @map("Password")
   email                       String                  @map("Email")
   phone                       String?                 @map("Phone")
@@ -410,4 +413,42 @@ model WorkerPushToken {
 
   @@index([workerId], map: "worker_push_token_worker_id_idx")
   @@map("worker_push_token")
+}
+
+model AuthRefreshSession {
+  id String @id
+  workerId BigInt
+  tokenHash String @unique
+  authVersion Int
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+  @@index([workerId])
+}
+
+model AuthRecoveryToken {
+  authVersion Int @default(0)
+  id String @id
+  workerId BigInt
+  tokenHash String @unique
+  purpose String
+  email String?
+  attempts Int @default(0)
+  expiresAt DateTime
+  consumedAt DateTime?
+  createdAt DateTime @default(now())
+  @@index([workerId, purpose])
+}
+
+model AuthAttemptLimit {
+  key String @id
+  count Int @default(0)
+  expiresAt DateTime
+}
+
+model AuthAssistanceAudit {
+  id String @id
+  managerId BigInt
+  workerId BigInt
+  reason String
+  createdAt DateTime @default(now())
 }

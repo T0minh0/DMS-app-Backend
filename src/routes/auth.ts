@@ -2,6 +2,9 @@ import { FastifyPluginAsync } from "fastify";
 import { z } from "zod";
 import { prisma } from "../prisma";
 import { compare, hash } from "bcryptjs";
+import { limit } from "./recovery";
+import { validNewPassword } from "../lib/auth/password";
+import { makeRefresh } from "../lib/auth/session";
 import { mapUserTypeToRole } from "../lib/userType";
 
 const loginBodySchema = z.object({
@@ -10,14 +13,17 @@ const loginBodySchema = z.object({
     .min(11, "Informe o CPF.")
     .transform((value) => value.replace(/\D/g, ""))
     .refine((value) => value.length === 11, "Informe um CPF válido."),
-  password: z.string().min(1, "Informe a senha.")
+  password: z.string().min(1, "Informe a senha."),
+  sessionVersion: z.literal(2).optional()
 });
 
 export const authRoutes: FastifyPluginAsync = async (server) => {
   server.post(
     "/login",
     async (request, reply) => {
-      const { cpf, password } = loginBodySchema.parse(request.body);
+      const { cpf, password, sessionVersion } = loginBodySchema.parse(request.body);
+      const allowed = await Promise.all([limit(`login:cpf:${cpf}`, 10, 900), limit(`login:ip:${request.ip}`, 100, 900)]);
+      if (!allowed.every(Boolean)) throw server.httpErrors.tooManyRequests("Muitas tentativas. Tente mais tarde.");
       const worker = await prisma.workers.findFirst({
         where: { cpf: Buffer.from(cpf, "utf-8") },
         select: {
@@ -26,6 +32,7 @@ export const authRoutes: FastifyPluginAsync = async (server) => {
           email: true,
           cpf: true,
           password: true,
+          authVersion: true,
           userType: true,
           cooperative: true,
           cooperativeRef: {
@@ -49,8 +56,9 @@ export const authRoutes: FastifyPluginAsync = async (server) => {
       }
 
       const token = await server.jwt.sign({
-        userId: worker.workerId.toString()
-      });
+        userId: worker.workerId.toString(), authVersion: worker.authVersion
+      }, sessionVersion === 2 ? { expiresIn: "15m" } : {});
+      const refreshToken = sessionVersion === 2 ? await makeRefresh(worker.workerId, worker.authVersion) : undefined;
 
       const workerCpf =
         worker.cpf && worker.cpf.length > 0
@@ -59,6 +67,7 @@ export const authRoutes: FastifyPluginAsync = async (server) => {
 
       return {
         accessToken: token,
+        ...(refreshToken ? { refreshToken, expiresIn: 900 } : {}),
         user: {
           id: worker.workerId.toString(),
           name: worker.workerName,
@@ -90,6 +99,8 @@ export const authRoutes: FastifyPluginAsync = async (server) => {
           workerId: true,
           workerName: true,
           email: true,
+          recoveryEmail: true,
+          recoveryEmailVerified: true,
           cpf: true,
           userType: true,
           cooperative: true,
@@ -115,6 +126,8 @@ export const authRoutes: FastifyPluginAsync = async (server) => {
         id: worker.workerId.toString(),
         name: worker.workerName,
         email: worker.email,
+        recoveryEmail: worker.recoveryEmail,
+        recoveryEmailVerified: worker.recoveryEmailVerified,
         cpf: workerCpf,
         userType: mapUserTypeToRole(worker.userType),
         cooperativeId: worker.cooperative
@@ -186,8 +199,10 @@ export const authRoutes: FastifyPluginAsync = async (server) => {
         if (!isValid) {
           throw server.httpErrors.unauthorized("Senha atual incorreta.");
         }
+        if (!validNewPassword(newPassword, mapUserTypeToRole(worker.userType))) throw server.httpErrors.badRequest("Senha inválida.");
         const newPasswordHash = await hash(newPassword, 10);
         updateData.password = Buffer.from(newPasswordHash, "utf-8");
+        updateData.authVersion = { increment: 1 };
       }
 
       if (Object.keys(updateData).length === 0) {

@@ -22,6 +22,7 @@ const envSchema = z.object({
   DMS_TRUSTED_PROXY_CIDRS: z.string().optional().refine(value => {
     try { parseTrustedProxyCidrs(value); return true; } catch { return false; }
   }, "DMS_TRUSTED_PROXY_CIDRS must contain explicit valid IP addresses or CIDRs, without /0"),
+  DMS_TRUSTED_CLIENT_IP_HEADER: z.enum(["cf-connecting-ip"]).optional(),
   AUTH_PROXY_SECRET: z.string().min(32).optional(),
   RESEND_API_KEY: z.string().min(1).optional(),
   RECOVERY_EMAIL_FROM: z.string().min(1).optional(),

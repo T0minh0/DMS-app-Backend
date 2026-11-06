@@ -24,5 +24,28 @@ test('trust defaults off and unsafe proxy configurations fail closed', async () 
   const server = buildServer(''); server.get('/test-ip', async req => ({ip:req.ip}));
   const response = await server.inject({method:'GET',url:'/test-ip',remoteAddress:'10.0.1.4',headers:{'x-forwarded-for':'203.0.113.9'}});
   assert.equal(response.json().ip,'10.0.1.4'); await server.close();
+  assert.throws(() => buildServer('', 'cf-connecting-ip'));
   for (const unsafe of ['0.0.0.0/0','::/0','true','10.0.1.0/33','10.0.1.0/24,,198.51.100.0/24']) assert.throws(() => buildServer(unsafe),undefined,unsafe);
+});
+
+test('Cloudflare client header overrides untrusted forwarding only from an explicit trusted peer', async () => {
+  const { buildServer } = await import('../src/server');
+  const server = buildServer('10.0.1.28/32', 'cf-connecting-ip');
+  server.get('/test-ip', async req => ({ ip: req.ip })); await server.ready();
+  const lookup = async (remoteAddress:string, headers:Record<string,string>) => (await server.inject({method:'GET',url:'/test-ip',remoteAddress,headers})).json().ip;
+  assert.equal(await lookup('10.0.1.28', {'cf-connecting-ip':'203.0.113.9'}), '203.0.113.9');
+  assert.equal(await lookup('10.0.1.28', {'cf-connecting-ip':'203.0.113.9','x-forwarded-for':'192.0.2.55'}), '203.0.113.9');
+  assert.equal(await lookup('10.0.1.28', {'cf-connecting-ip':'2001:db8::42'}), '2001:db8::42');
+  assert.equal(await lookup('10.0.1.29', {'cf-connecting-ip':'203.0.113.9','x-forwarded-for':'192.0.2.55'}), '10.0.1.29');
+  assert.equal(await lookup('10.0.1.28', {'cf-connecting-ip':'203.0.113.9, 192.0.2.55','x-forwarded-for':'192.0.2.55'}), '10.0.1.28');
+  assert.equal(await lookup('10.0.1.28', {'x-forwarded-for':'192.0.2.55'}), '10.0.1.28');
+  assert.equal(await lookup('10.0.1.28', {'cf-connecting-ip':'not-an-ip','x-forwarded-for':'192.0.2.55'}), '10.0.1.28');
+  await server.close();
+});
+
+test('Cloudflare client header is ignored by default', async () => {
+  const { buildServer } = await import('../src/server');
+  const server = buildServer('10.0.1.28/32'); server.get('/test-ip', async req => ({ip:req.ip}));
+  const response = await server.inject({method:'GET',url:'/test-ip',remoteAddress:'10.0.1.28',headers:{'cf-connecting-ip':'203.0.113.9'}});
+  assert.equal(response.json().ip,'10.0.1.28'); await server.close();
 });

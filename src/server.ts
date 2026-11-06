@@ -1,4 +1,6 @@
 import Fastify from "fastify";
+import proxyAddr from "@fastify/proxy-addr";
+import { isIP } from "node:net";
 import cors from "@fastify/cors";
 import sensible from "@fastify/sensible";
 import jwt from "@fastify/jwt";
@@ -18,9 +20,15 @@ import { gamificationRoutes } from "./routes/gamification";
 import { workersRoutes } from "./routes/workers";
 import { pushRoutes } from "./routes/push";
 
-export function buildServer(trustedProxyCidrs = env.DMS_TRUSTED_PROXY_CIDRS) {
+export function buildServer(
+  trustedProxyCidrs = env.DMS_TRUSTED_PROXY_CIDRS,
+  trustedClientIpHeader = env.DMS_TRUSTED_CLIENT_IP_HEADER,
+) {
+  const proxyCidrs = parseTrustedProxyCidrs(trustedProxyCidrs);
+  if (trustedClientIpHeader && !proxyCidrs) throw new Error("Trusted client IP header requires explicit trusted proxy CIDRs");
+  const trustProxy = proxyCidrs ? proxyAddr.compile(proxyCidrs) : false;
   const server = Fastify({
-    trustProxy: parseTrustedProxyCidrs(trustedProxyCidrs),
+    trustProxy,
     disableRequestLogging: true,
     logger:
       env.NODE_ENV === "production"
@@ -35,6 +43,21 @@ export function buildServer(trustedProxyCidrs = env.DMS_TRUSTED_PROXY_CIDRS) {
             }
           }
   });
+
+  if (trustedClientIpHeader && trustProxy) {
+    server.addHook("onRequest", async (request) => {
+      const peer = request.raw.socket.remoteAddress;
+      if (!peer || !trustProxy(peer, 0)) return;
+      const value = request.raw.headers[trustedClientIpHeader];
+      // A missing, duplicated, or invalid Cloudflare header must not leave a
+      // caller-supplied X-Forwarded-For value as an apparent client address.
+      if (typeof value === "string" && !value.includes("%") && isIP(value)) {
+        request.raw.headers["x-forwarded-for"] = value;
+      } else {
+        delete request.raw.headers["x-forwarded-for"];
+      }
+    });
+  }
 
   void server.register(cors, {
     origin: true,

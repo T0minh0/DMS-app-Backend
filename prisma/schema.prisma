@@ -470,3 +470,19 @@ model AuthMailOutbox {
   attempts Int @default(0)
   createdAt DateTime @default(now())
 }
+
+/// Original effects retained after deletion for accounting traceability.
+model MeasurementEffect {
+  measurementId    BigInt   @id @map("measurement_id")
+  cooperativeId    BigInt   @map("cooperative_id")
+  materialId       BigInt   @map("material_id")
+  collectedDeltaKg Decimal  @map("collected_delta_kg") @db.Decimal(65, 2)
+  currentDeltaKg   Decimal  @map("current_delta_kg") @db.Decimal(65, 2)
+  bagBefore        Json?    @map("bag_before")
+  bagAfter         Json?    @map("bag_after")
+  source           String
+  createdAt        DateTime @default(now()) @map("created_at") @db.Timestamp(6)
+
+  @@index([cooperativeId, materialId], map: "measurement_effect_cooperative_material_idx")
+  @@map("measurement_effect")
+}

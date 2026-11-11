@@ -225,6 +225,15 @@ export async function recordMobileWeighing(
     },
   }) as MobileMeasurementWithRefs;
 
+  // Capture exact effects before changing the locked bag, so the web manager
+  // can reverse this entry without guessing its original physical balance.
+  const bagBefore = JSON.stringify({ isBegun: lockedBagState.isBegun, currentKg: formatDecimal(lockedBagState.currentKg) });
+  const bagAfter = JSON.stringify({ isBegun: delta.isBegun, currentKg: formatDecimal(delta.nextCurrentKg) });
+  await tx.$executeRaw`
+    INSERT INTO measurement_effect (measurement_id,cooperative_id,material_id,collected_delta_kg,current_delta_kg,bag_before,bag_after,source)
+    VALUES (${measurement.weightingId},${input.cooperativeId},${input.materialId},${delta.collectedDeltaKg},${delta.collectedDeltaKg},${bagBefore}::jsonb,${bagAfter}::jsonb,'mobile')
+  `;
+
   await tx.materialBagState.update({
     where: {
       cooperativeId_materialId: {

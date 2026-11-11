@@ -67,3 +67,11 @@ curl -X POST http://localhost:3333/auth/login \
 ```
 
 The response returns a JWT token that the mobile app reuses for protected routes.
+
+## Efeitos reversíveis de pesagem
+
+Cada pesagem nova grava `measurement_effect` na mesma transação da medição, saco e estoque. O portal usa esses efeitos para permitir exclusão individual por gestores, com motivo e auditoria, sem inferir o histórico do saco.
+
+**Ordem de publicação:** aplicar primeiro as migrations do portal web que criam `measurement_effect` e `collection_deletion_audit`; somente depois publicar este backend. O backend móvel não cria nem migra essas tabelas. Registros antigos sem efeitos continuam exigindo correção assistida.
+
+Teste com PostgreSQL descartável preparado pelas migrations web: definir `COLLECTION_TEST_DATABASE_URL` para `dms_collection_delete_test` em `localhost`/`127.0.0.1` e executar `npm test`. Nunca apontar os testes para produção.

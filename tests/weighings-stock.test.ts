@@ -108,6 +108,7 @@ function createFakeTx() {
     const sql = strings.join("?");
     calls.push(sql);
 
+    if (/INSERT INTO measurement_effect/.test(sql)) return 1;
     if (/INSERT INTO "material_bag_state"/.test(sql)) {
       assert.match(sql, /ON CONFLICT \("cooperative_id", "material_id"\) DO NOTHING/);
       const cooperativeId = toBigInt(values[0]);
